@@ -1,7 +1,9 @@
 import json
+import datetime
 from datetime import date
 from dateutil import parser
 import sqlite3
+import numpy as np
 
 JSON = 'json'
 DB_COL = 'db_col'
@@ -9,11 +11,14 @@ TYPE = 'type'
 FACTOR = 'factor'
 REAL = 'REAL'
 INTEGER = 'INTEGER'
-BOOLEAN = 'VARCHAR(8)'      # storing Boolean as String in Warehouse
+BOOLEAN = 'BOOLEAN'
 DEFAULT = 'DEFAULT'
 AGGREGATION_METHOD = 'AggMethod'
 SUM = 'Sum'
 MEAN = 'Mean'
+DAY = 'Day'
+WEEK = 'Week'
+MONTH = 'Month'
 
 workout_map = [{JSON: 'km', DB_COL: 'km', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0.0, AGGREGATION_METHOD: SUM},
                {JSON: 'km', DB_COL: 'miles', TYPE: REAL, FACTOR: 0.621371, DEFAULT: 0.0, AGGREGATION_METHOD: SUM},
@@ -28,36 +33,53 @@ workout_map = [{JSON: 'km', DB_COL: 'km', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0.0,
                {JSON: 'ascentMetres', DB_COL: 'ascent_feet', TYPE: INTEGER, FACTOR: 3.28084, DEFAULT: 0, AGGREGATION_METHOD: SUM},
                {JSON: 'kj', DB_COL: 'kj', TYPE: INTEGER, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
                {JSON: 'reps', DB_COL: 'reps', TYPE: INTEGER, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
-               {JSON: 'isRace', DB_COL: 'is_race', TYPE: BOOLEAN, FACTOR: 1.0, DEFAULT: 'False', AGGREGATION_METHOD: SUM},
-               {JSON: 'brick', DB_COL: 'brick', TYPE: BOOLEAN, FACTOR: 1.0, DEFAULT: 'False', AGGREGATION_METHOD: SUM},
-               {JSON: 'wattsEstimated', DB_COL: 'watts_estimated', TYPE: BOOLEAN, FACTOR: 1.0, DEFAULT: 'False', AGGREGATION_METHOD: SUM},
+               {JSON: 'isRace', DB_COL: 'is_race', TYPE: BOOLEAN, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
+               {JSON: 'brick', DB_COL: 'brick', TYPE: BOOLEAN, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
+               {JSON: 'wattsEstimated', DB_COL: 'watts_estimated', TYPE: BOOLEAN, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
                {JSON: 'cadence', DB_COL: 'cadence', TYPE: INTEGER, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: MEAN}]
 
 workout_col_names = ','.join([m[DB_COL] for m in workout_map])
 workout_zeroes = ','.join(['0' for _ in workout_map])
 workout_col_creation = ','.join(f"{m[DB_COL]} {m[TYPE]} DEFAULT {m[DEFAULT]}" for m in workout_map)
 
-day_map = [{JSON: 'fatigue', DB_COL: 'fatigue', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0},
-           {JSON: 'motivation', DB_COL: 'motivation', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0},
-           {JSON: 'sleep', DB_COL: 'sleep_seconds', TYPE: INTEGER, FACTOR: 60.0 * 60.0, DEFAULT: 0},
-           {JSON: 'sleep', DB_COL: 'sleep_minutes', TYPE: INTEGER, FACTOR: 60.0, DEFAULT: 0},
-           {JSON: 'sleep', DB_COL: 'sleep_hours', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0.0},
+day_map = [{JSON: 'fatigue', DB_COL: 'fatigue', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: MEAN},
+           {JSON: 'motivation', DB_COL: 'motivation', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: MEAN},
+           {JSON: 'sleep', DB_COL: 'sleep_seconds', TYPE: INTEGER, FACTOR: 60.0 * 60.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
+           {JSON: 'sleep', DB_COL: 'sleep_minutes', TYPE: INTEGER, FACTOR: 60.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
+           {JSON: 'sleep', DB_COL: 'sleep_hours', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0.0, AGGREGATION_METHOD: SUM},
            {JSON: 'type', DB_COL: 'type', TYPE: 'VARCHAR(32)', FACTOR: 1.0, DEFAULT: "Normal"},
            {JSON: 'sleepQuality', DB_COL: 'sleep_quality', TYPE: 'VARCHAR(32)', FACTOR: 1.0, DEFAULT: 'Average'}]
 
 day_col_names = ','.join(m[DB_COL] for m in day_map)
 day_col_creation = ','.join(f"{m[DB_COL]} {m[TYPE]} DEFAULT {m[DEFAULT]}" for m in day_map)
 
+calculated_map = [{DB_COL: 'ctl', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  {DB_COL: 'atl', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  {DB_COL: 'tsb', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  ]
+
+calculated_col_creation = ','.join(f"{m[DB_COL]} {m[TYPE]} DEFAULT {m[DEFAULT]}" for m in calculated_map)
+
 ACTIVITY = 'activityString'
 ACTIVITY_TYPE = 'activityTypeString'
 EQUIPMENT = 'equipmentName'
 NOT_SET = 'Not Set'
 
+CTL_DECAY_DAYS = 42
+CTL_IMPACT_DAYS = 42
+ATL_DECAY_DAYS = 7
+ATL_IMPACT_DAYS = 7
+CTL_DECAY = np.exp(-1 / CTL_DECAY_DAYS)
+CTL_IMPACT = 1 - np.exp(-1 / CTL_IMPACT_DAYS)
+ATL_DECAY = np.exp(-1 / ATL_DECAY_DAYS)
+ATL_IMPACT = 1 - np.exp(-1 / ATL_IMPACT_DAYS)
 table_names = set()
+
+DB_NAME = 'training_data_warehouse.db'
 
 def populate():
 
-    conn = sqlite3.connect('training_data_warehouse.db')
+    conn = sqlite3.connect(DB_NAME)
 
     f = open('TrainingDiary.json')
     data = json.load(f)
@@ -71,43 +93,83 @@ def populate():
         if 'workouts' in d:
             save_workouts(conn, d_date, d_values, d['workouts'])
         else:
-            sql_str = f'''
-                
-                INSERT INTO DAY_All_All_All
-                (date, {day_col_names})
-                VALUES
-                (
-                '{d_date}',
-                {d_values}
-                )
-            '''
-            try:
-                conn.cursor().execute(sql_str)
-            except Exception as e:
-                print(e)
-                pass
+            execute_day_sql(conn, d_date, day_col_names, d_values,
+                            activity='All', activity_type='All', equipment_name='All')
 
     #    fill in gaps
         for t in table_names:
             if not day_exists(d_date, t, conn):
-                sql_str = f'''
-
-                    INSERT INTO {t}
-                    (date, {day_col_names})
-                    VALUES
-                    (
-                    '{d_date}',
-                    {d_values}
-                    )
-                '''
-                try:
-                    conn.cursor().execute(sql_str)
-                except Exception as e:
-                    print(e)
-                    pass
-
+                execute_day_sql(conn, d_date, day_col_names, d_values, table_name=t)
 
     conn.commit()
+    conn.close()
+
+
+def calculate_all_tsb():
+    sql_str = f'SELECT table_name FROM Tables'
+    conn = sqlite3.connect(DB_NAME)
+    results = conn.cursor().execute(sql_str)
+
+    for r in results:
+        calculate_tsb(conn, r[0])
+
+    conn.commit()
+
+
+def calculate_tsb(conn, table_name):
+    sql_str = f'SELECT id, tss FROM {table_name} ORDER BY date'
+    atl = ctl = 0.0
+
+    results = conn.cursor().execute(sql_str)
+    for r in results:
+        id = r[0]
+        tss = r[1]
+        ctl = tss * CTL_IMPACT + ctl * CTL_DECAY
+        atl = tss * ATL_IMPACT + atl * ATL_DECAY
+        tsb = ctl - atl
+        sql_str = f'UPDATE {table_name} SET ctl={ctl}, atl={atl}, tsb={tsb} WHERE id={id}'
+        conn.cursor().execute(sql_str)
+
+
+def create_and_populate_agg_tables(period):
+    agg_str, insert_str = create_agg_and_insert_str_for_sql()
+    conn = sqlite3.connect(DB_NAME)
+    sql_str = f'SELECT activity, activity_type, equipment FROM Tables WHERE period="{DAY}"'
+    tables = conn.cursor().execute(sql_str)
+
+    for t in tables:
+        create_and_populate_agg_table(conn, period, t[0], t[1], t[2], agg_str, insert_str)
+
+    conn.commit()
+
+
+def create_and_populate_agg_table(conn, period, activity, activity_type, equipment_name, aggregation_str, insert_str):
+    table_name = create_table(period, activity, activity_type, equipment_name, conn)
+    day_table = f'{DAY}_{activity}_{activity_type}_{equipment_name}'
+
+    if period == WEEK:
+        agg = 'year_week'
+    elif period == MONTH:
+        agg = 'year_month'
+    else:
+        print(f'{period} unsupported')
+        return
+
+    sql_str = f'''
+            SELECT {agg}, {aggregation_str}
+            FROM {day_table}
+            GROUP BY {agg}
+    '''
+    result = conn.cursor().execute(sql_str)
+    for r in result:
+        sql_str = f'''
+            INSERT INTO {table_name}
+            ({agg}, {insert_str})
+            VALUES
+            {r}
+        '''
+        conn.cursor().execute(sql_str)
+
 
 def save_workouts(conn, d_date, d_values, workouts):
     aggregation_keys = [[ACTIVITY, ACTIVITY_TYPE, EQUIPMENT],
@@ -139,59 +201,15 @@ def save_workout(conn, d_date, d_values, workout, keys):
     if EQUIPMENT in keys:
         e_name = workout[EQUIPMENT].replace(' ', '')
 
-    table_name = f'DAY_{a}_{at}_{e_name}'
-    day_key = f'{d_date}:{table_name}'
+    day_key = f'{d_date}:{DAY}_{a}_{at}_{e_name}'
 
-    _ = create_table(table_name, conn)
+    _ = create_table(DAY, a, at, e_name, conn)
 
-    if day_exists(d_date, table_name, conn):
-        #  this needs to aggregate
-        #  todo fix
-        print(f'Day EXISTS: {d_date} {table_name}')
+    w_values = value_string_for_sql(workout, workout_map)
 
-    values = value_string_for_sql(workout, workout_map)
-
-    sql_str = f"""
-
-        INSERT INTO {table_name}
-        (date, {day_col_names},  {workout_col_names})
-        VALUES
-        ('{d_date}',
-        {d_values},
-        {values}
-        )
-
-    """
-
-    try:
-        c.execute(sql_str)
-    except TypeError as te:
-        print(te)
-    except sqlite3.OperationalError as e:
-        print(e)
-        print(sql_str)
-    except sqlite3.IntegrityError as e:
-        print(e)
-        print(day_key)
-
-    if not table_exists(table_name, conn):
-
-        sql_str = f"""
-    
-            INSERT INTO Tables
-            (activity, activity_type, equipment, table_name)
-            VALUES
-            ('{a}',
-            '{at}',
-            '{e_name}',
-            '{table_name}'
-            )
-    
-        """
-        try:
-            c.execute(sql_str)
-        except Exception as e:
-            print(e)
+    col_names = f'{day_col_names}, {workout_col_names}'
+    d_values = f'{d_values}, {w_values}'
+    execute_day_sql(conn, d_date, col_names, d_values, activity=a, activity_type=at, equipment_name=e_name)
 
 
 # take workouts and combine those that have same Activity:Type:Equipment
@@ -243,9 +261,9 @@ def value_string_for_sql(dictionary, json_map):
             d_value_array.append(str(round(float(dictionary[m[JSON]]) * m[FACTOR],2)))
         elif m[TYPE] == BOOLEAN:
             if dictionary[m[JSON]] == 0:
-                d_value_array.append("'False'")
+                d_value_array.append('0')
             else:
-                d_value_array.append("'True'")
+                d_value_array.append('1')
         else:
             d_value_array.append(f"'{dictionary[m[JSON]]}'")
 
@@ -260,23 +278,20 @@ def day_exists(d, table, conn):
     return len(result.fetchall()) > 0
 
 
-def table_exists(table_name, conn):
-    sql_str = f'''
-            SELECT id FROM Tables WHERE table_name="{table_name}"
-    '''
-    result = conn.cursor().execute(sql_str)
-    return len(result.fetchall()) > 0
+def create_table(period, activity, activity_type, equipment_name, conn):
 
-
-def create_table(table_name, conn):
+    table_name = f'{period}_{activity}_{activity_type}_{equipment_name}'
 
     sql_str = f'''
     
         CREATE TABLE {table_name}
         (id INTEGER PRIMARY KEY AUTOINCREMENT,
         date DATE UNIQUE,
+        year_week VARCHAR(16),
+        year_month VARCHAR(16),
         {day_col_creation},
-        {workout_col_creation})
+        {workout_col_creation},
+        {calculated_col_creation})
     
         '''
 
@@ -284,34 +299,90 @@ def create_table(table_name, conn):
         conn.cursor().execute(sql_str)
         conn.commit()
         table_names.add(table_name)
-        return True
+
+        sql_str = f"""
+
+            INSERT INTO Tables
+            (period, activity, activity_type, equipment, table_name)
+            VALUES
+            ('{period}',
+            '{activity}',
+            '{activity_type}',
+            '{equipment_name}',
+            '{table_name}'
+            )
+
+        """
+        conn.cursor().execute(sql_str)
+        conn.commit()
+
     except Exception as e:
         pass
 
+    return table_name
+
+
+def execute_day_sql(conn, d_date, col_names, values, activity='All', activity_type='All', equipment_name='All', table_name=None):
+
+    t_name = table_name
+    if table_name is None:
+        t_name = f'{DAY}_{activity}_{activity_type}_{equipment_name}'
+
+    d_month = f'{d_date.year}-{d_date.strftime("%b")}'
+    d_week = f'{d_date.year}-{d_date.isocalendar()[1]}'
+
+    sql_str = f'''
+
+        INSERT INTO {t_name}
+        (date, year_week, year_month, {col_names})
+        VALUES
+        (
+        '{d_date}',
+        '{d_week}',
+        '{d_month}',
+        {values}
+        )
+    '''
+
+    try:
+        conn.cursor().execute(sql_str)
+        # conn.commit()
+    except Exception as e:
+        print(e)
+
+def create_agg_and_insert_str_for_sql():
+    aggregate_array = ['MAX(date)']
+    insert_array = ['date']
+    for m in (workout_map + day_map + calculated_map):
+        if AGGREGATION_METHOD in m:
+            if m[AGGREGATION_METHOD] == SUM:
+                aggregate_array.append(f'SUM({m[DB_COL]})')
+                insert_array.append(m[DB_COL])
+            elif m[AGGREGATION_METHOD] == MEAN:
+                aggregate_array.append(f'AVG({m[DB_COL]})')
+                insert_array.append(m[DB_COL])
+
+    return ','.join(aggregate_array), ','.join(insert_array)
 
 
 
 if __name__ == '__main__':
+    start = datetime.datetime.now()
+    print('Basic day info...')
     populate()
-    # conn = sqlite3.connect('training_data_warehouse.db')
-    # tables = f'''
-    #     SELECT table_name FROM Tables
-    #
-    # '''
-    # result = conn.cursor().execute(tables)
-    #
-    # for t in result.fetchall():
-    #     sql_str = f'''
-    #         SELECT * FROM {t[0]}
-    #         WHERE date='2016-02-02'
-    #     '''
-    #     try:
-    #         result = conn.cursor().execute(sql_str)
-    #         data = result.fetchall()
-    #         if len(data)>0:
-    #             if data[0][14] is not None and data[0][14] > 0:
-    #                 # print(data[0])
-    #                 print(f'{data[0][1]}: {data[0][14]} \t~ {t[0]}')
-    #     except Exception as e:
-    #         print(e)
-    #         pass
+    print(f'DONE in {datetime.datetime.now() - start}')
+
+    start = datetime.datetime.now()
+    print('Calculating TSB ...')
+    calculate_all_tsb()
+    print(f'DONE in {datetime.datetime.now() - start}')
+
+    start = datetime.datetime.now()
+    print('Creating weekly tables ...')
+    create_and_populate_agg_tables(WEEK)
+    print(f'DONE in {datetime.datetime.now() - start}')
+
+    start = datetime.datetime.now()
+    print('Creating monthly tables ...')
+    create_and_populate_agg_tables(MONTH)
+    print(f'DONE in {datetime.datetime.now() - start}')
