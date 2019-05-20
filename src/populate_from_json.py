@@ -42,7 +42,7 @@ workout_map = [{JSON: 'km', DB_COL: 'km', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0.0,
 
 workout_col_names = ','.join([m[DB_COL] for m in workout_map])
 workout_zeroes = ','.join(['0' for _ in workout_map])
-workout_col_creation = ','.join(f"{m[DB_COL]} {m[TYPE]} DEFAULT {m[DEFAULT]}" for m in workout_map)
+workout_col_creation = ','.join(f'{m[DB_COL]} {m[TYPE]} DEFAULT {m[DEFAULT]}' for m in workout_map)
 
 day_map = [{JSON: 'fatigue', DB_COL: 'fatigue', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: MEAN},
            {JSON: 'motivation', DB_COL: 'motivation', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: MEAN},
