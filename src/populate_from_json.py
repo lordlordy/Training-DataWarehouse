@@ -4,6 +4,8 @@ from datetime import date
 from dateutil import parser
 import sqlite3
 import numpy as np
+import pandas as pd
+import math
 
 JSON = 'json'
 DB_COL = 'db_col'
@@ -60,6 +62,16 @@ calculated_map = [{DB_COL: 'ctl', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: 
 
 calculated_col_creation = ','.join(f"{m[DB_COL]} {m[TYPE]} DEFAULT {m[DEFAULT]}" for m in calculated_map)
 
+physiological_map = [{DB_COL: 'kg', TYPE: REAL},
+                  {DB_COL: 'lbs', TYPE: REAL},
+                  {DB_COL: 'fat_percentage', TYPE: REAL},
+                  {DB_COL: 'resting_hr', TYPE: INTEGER},
+                  {DB_COL: 'sdnn', TYPE: REAL},
+                  {DB_COL: 'rmssd', TYPE: REAL},
+                  ]
+
+physiological_col_creation = ','.join(f"{m[DB_COL]} {m[TYPE]}" for m in physiological_map)
+
 ACTIVITY = 'activityString'
 ACTIVITY_TYPE = 'activityTypeString'
 EQUIPMENT = 'equipmentName'
@@ -75,7 +87,7 @@ ATL_DECAY = np.exp(-1 / ATL_DECAY_DAYS)
 ATL_IMPACT = 1 - np.exp(-1 / ATL_IMPACT_DAYS)
 table_names = set()
 
-DB_NAME = 'training_data_warehouse.db'
+DB_NAME = 'training_data_warehouse.sqlite3'
 
 def populate():
 
@@ -85,33 +97,135 @@ def populate():
     data = json.load(f)
     days = data['days']
 
+    min_date = datetime.datetime.now().date()
+    max_date = datetime.date(year=1, month=1, day=1)
+
     for d in days:
         date_time = parser.parse(d['iso8061DateString'])
         d_date = date(date_time.year, date_time.month, date_time.day)
+        min_date = min(min_date, d_date)
+        max_date = max(max_date, d_date)
+
         d_values = value_string_for_sql(d, day_map)
 
         if 'workouts' in d:
-            save_workouts(conn, d_date, d_values, d['workouts'])
+            save_workouts(conn, d_date, d['type'], d_values, d['workouts'])
         else:
-            execute_day_sql(conn, d_date, day_col_names, d_values,
+            execute_day_sql(conn, d_date, d['type'], day_col_names, d_values,
                             activity='All', activity_type='All', equipment_name='All')
 
     #    fill in gaps
         for t in table_names:
             if not day_exists(d_date, t, conn):
-                execute_day_sql(conn, d_date, day_col_names, d_values, table_name=t)
+                execute_day_sql(conn, d_date, d['type'], day_col_names, d_values, table_name=t)
+
+    populate_kg_fat_percent(conn, data, min_date, max_date)
+    populate_hr_sdnn_rmssd(conn, data, min_date, max_date)
 
     conn.commit()
     conn.close()
 
 
-def calculate_all_tsb():
-    sql_str = f'SELECT table_name FROM Tables'
-    conn = sqlite3.connect(DB_NAME)
-    results = conn.cursor().execute(sql_str)
+def populate_kg_fat_percent(conn, data, min_date, max_date):
+    kg_dates = []
+    kg_array = []
+    fat_dates = []
+    fat_percent = []
+    if 'weights' in data:
+        for d in data['weights']:
+            date_time = parser.parse(d['iso8061DateString'])
+            d_date = date(date_time.year, date_time.month, date_time.day)
+            kg = round(float(d['kg']), 1)
+            fat = round(float(d['fatPercent']), 1)
+            if kg > 0:
+                kg_dates.append(d_date)
+                kg_array.append(kg)
+            if fat > 0:
+                fat_dates.append(d_date)
+                fat_percent.append(fat)
+    kg_series = pd.Series(kg_array, index=pd.to_datetime(kg_dates))
+    kg_series = kg_series.reindex(index=pd.date_range(min_date, max_date)).interpolate(method='linear')
+    fat_series = pd.Series(fat_percent, index=pd.to_datetime(fat_dates))
+    fat_series = fat_series.reindex(index=pd.date_range(min_date, max_date)).interpolate(method='linear')
 
-    for r in results:
-        calculate_tsb(conn, r[0])
+    for table in table_list(conn):
+        for d, value in kg_series.iteritems():
+            if math.isnan(value):
+                value = 0
+            lbs = round(value * 2.20462, 1)
+            sql_str = f'UPDATE {table} SET kg={round(value,1)}, lbs={lbs} WHERE date="{str(d.date())}"'
+            conn.cursor().execute(sql_str)
+        for d, value in fat_series.iteritems():
+            if math.isnan(value):
+                value = 0
+            sql_str = f'UPDATE {table} SET fat_percentage={round(value,1)} WHERE date="{str(d.date())}"'
+            conn.cursor().execute(sql_str)
+
+
+def populate_hr_sdnn_rmssd(conn, data, min_date, max_date):
+    hr_dates = []
+    hr_array = []
+    sdnn_dates = []
+    sdnn_array = []
+    rmssd_dates = []
+    rmssd_array = []
+    if 'physiologicals' in data:
+        for d in data['physiologicals']:
+            date_time = parser.parse(d['iso8061DateString'])
+            d_date = date(date_time.year, date_time.month, date_time.day)
+            hr = sdnn = rmssd = 0
+            if d['restingHR'] is not None:
+                hr = int(d['restingHR'])
+            if d['restingSDNN'] is not None:
+                sdnn = round(float(d['restingSDNN']), 1)
+            if d['restingRMSSD'] is not None:
+                rmssd = round(float(d['restingRMSSD']), 1)
+            if hr > 0:
+                hr_dates.append(d_date)
+                hr_array.append(hr)
+            if sdnn > 0:
+                sdnn_dates.append(d_date)
+                sdnn_array.append(sdnn)
+            if rmssd > 0:
+                rmssd_dates.append(d_date)
+                rmssd_array.append(sdnn)
+    hr_series = pd.Series(hr_array, index=pd.to_datetime(hr_dates))
+    hr_series = hr_series.reindex(index=pd.date_range(min_date, max_date)).interpolate(method='linear')
+    sdnn_series = pd.Series(sdnn_array, index=pd.to_datetime(sdnn_dates))
+    sdnn_series = sdnn_series.reindex(index=pd.date_range(min_date, max_date)).interpolate(method='linear')
+    rmssd_series = pd.Series(sdnn_array, index=pd.to_datetime(rmssd_dates))
+    rmssd_series = rmssd_series.reindex(index=pd.date_range(min_date, max_date)).interpolate(method='linear')
+
+    for table in table_list(conn):
+        for d, value in hr_series.iteritems():
+            if value is None or math.isnan(value):
+                value = 0
+            sql_str = f'UPDATE {table} SET resting_hr={value} WHERE date="{str(d.date())}"'
+            conn.cursor().execute(sql_str)
+        for d, value in sdnn_series.iteritems():
+            if value is None or math.isnan(value):
+                value = 0
+            sql_str = f'UPDATE {table} SET sdnn={round(value,1)} WHERE date="{str(d.date())}"'
+            conn.cursor().execute(sql_str)
+        for d, value in rmssd_series.iteritems():
+            if value is None or math.isnan(value):
+                value = 0
+            sql_str = f'UPDATE {table} SET rmssd={round(value,1)} WHERE date="{str(d.date())}"'
+            conn.cursor().execute(sql_str)
+
+
+
+def table_list(conn):
+    sql_str = f'SELECT table_name FROM Tables'
+    results = conn.cursor().execute(sql_str)
+    return [r[0] for r in results]
+
+
+def calculate_all_tsb():
+    conn = sqlite3.connect(DB_NAME)
+
+    for r in table_list(conn):
+        calculate_tsb(conn, r)
 
     conn.commit()
 
@@ -171,7 +285,7 @@ def create_and_populate_agg_table(conn, period, activity, activity_type, equipme
         conn.cursor().execute(sql_str)
 
 
-def save_workouts(conn, d_date, d_values, workouts):
+def save_workouts(conn, d_date, d_type, d_values, workouts):
     aggregation_keys = [[ACTIVITY, ACTIVITY_TYPE, EQUIPMENT],
                         [ACTIVITY_TYPE, EQUIPMENT],
                         [ACTIVITY, EQUIPMENT],
@@ -184,11 +298,10 @@ def save_workouts(conn, d_date, d_values, workouts):
     for a in aggregation_keys:
         agg_workouts = aggregate_workouts(workouts, a)
         for w in agg_workouts:
-            save_workout(conn, d_date, d_values, w, a)
+            save_workout(conn, d_date, d_type, d_values, w, a)
 
 
-def save_workout(conn, d_date, d_values, workout, keys):
-    c = conn.cursor()
+def save_workout(conn, d_date, d_type, d_values, workout, keys):
 
     a = 'All'
     at = 'All'
@@ -201,15 +314,13 @@ def save_workout(conn, d_date, d_values, workout, keys):
     if EQUIPMENT in keys:
         e_name = workout[EQUIPMENT].replace(' ', '')
 
-    day_key = f'{d_date}:{DAY}_{a}_{at}_{e_name}'
-
     _ = create_table(DAY, a, at, e_name, conn)
 
     w_values = value_string_for_sql(workout, workout_map)
 
     col_names = f'{day_col_names}, {workout_col_names}'
     d_values = f'{d_values}, {w_values}'
-    execute_day_sql(conn, d_date, col_names, d_values, activity=a, activity_type=at, equipment_name=e_name)
+    execute_day_sql(conn, d_date, d_type, col_names, d_values, activity=a, activity_type=at, equipment_name=e_name)
 
 
 # take workouts and combine those that have same Activity:Type:Equipment
@@ -289,10 +400,13 @@ def create_table(period, activity, activity_type, equipment_name, conn):
         date DATE UNIQUE,
         year_week VARCHAR(16),
         year_month VARCHAR(16),
+        day_of_week VARCHAR(8),
+        month VARCHAR(8),
+        day_type VARCHAR(16),
         {day_col_creation},
         {workout_col_creation},
-        {calculated_col_creation})
-    
+        {calculated_col_creation},
+        {physiological_col_creation})
         '''
 
     try:
@@ -322,7 +436,7 @@ def create_table(period, activity, activity_type, equipment_name, conn):
     return table_name
 
 
-def execute_day_sql(conn, d_date, col_names, values, activity='All', activity_type='All', equipment_name='All', table_name=None):
+def execute_day_sql(conn, d_date, d_type, col_names, values, activity='All', activity_type='All', equipment_name='All', table_name=None):
 
     t_name = table_name
     if table_name is None:
@@ -330,16 +444,21 @@ def execute_day_sql(conn, d_date, col_names, values, activity='All', activity_ty
 
     d_month = f'{d_date.year}-{d_date.strftime("%b")}'
     d_week = f'{d_date.year}-{d_date.isocalendar()[1]}'
+    d_day = d_date.strftime('%a')
+    month = d_date.strftime('%b')
 
     sql_str = f'''
 
         INSERT INTO {t_name}
-        (date, year_week, year_month, {col_names})
+        (date, year_week, year_month, day_of_week, month, day_type, {col_names})
         VALUES
         (
         '{d_date}',
         '{d_week}',
         '{d_month}',
+        '{d_day}',
+        '{month}',
+        '{d_type}',
         {values}
         )
     '''
@@ -377,12 +496,16 @@ if __name__ == '__main__':
     calculate_all_tsb()
     print(f'DONE in {datetime.datetime.now() - start}')
 
-    start = datetime.datetime.now()
-    print('Creating weekly tables ...')
-    create_and_populate_agg_tables(WEEK)
-    print(f'DONE in {datetime.datetime.now() - start}')
+    # start = datetime.datetime.now()
+    # print('Creating weekly tables ...')
+    # create_and_populate_agg_tables(WEEK)
+    # print(f'DONE in {datetime.datetime.now() - start}')
+    #
+    # start = datetime.datetime.now()
+    # print('Creating monthly tables ...')
+    # create_and_populate_agg_tables(MONTH)
+    # print(f'DONE in {datetime.datetime.now() - start}')
 
-    start = datetime.datetime.now()
-    print('Creating monthly tables ...')
-    create_and_populate_agg_tables(MONTH)
-    print(f'DONE in {datetime.datetime.now() - start}')
+    # f = open('TrainingDiary.json')
+    # data = json.load(f)
+    # populate_kg_fat_percent(data)

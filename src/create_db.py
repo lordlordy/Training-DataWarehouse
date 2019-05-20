@@ -1,7 +1,7 @@
 import sqlite3
 
 
-conn = sqlite3.connect('training_data_warehouse.db')
+conn = sqlite3.connect('training_data_warehouse.sqlite3')
 c = conn.cursor()
 
 
