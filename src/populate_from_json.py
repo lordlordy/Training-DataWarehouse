@@ -16,14 +16,17 @@ INTEGER = 'INTEGER'
 BOOLEAN = 'BOOLEAN'
 DEFAULT = 'DEFAULT'
 AGGREGATION_METHOD = 'AggMethod'
+MAPPER = 'Mapper'
 SUM = 'Sum'
 MEAN = 'Mean'
 DAY = 'Day'
 WEEK = 'Week'
 MONTH = 'Month'
 
+MILES_PER_KM = 0.621371
+
 workout_map = [{JSON: 'km', DB_COL: 'km', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0.0, AGGREGATION_METHOD: SUM},
-               {JSON: 'km', DB_COL: 'miles', TYPE: REAL, FACTOR: 0.621371, DEFAULT: 0.0, AGGREGATION_METHOD: SUM},
+               {JSON: 'km', DB_COL: 'miles', TYPE: REAL, FACTOR: MILES_PER_KM, DEFAULT: 0.0, AGGREGATION_METHOD: SUM},
                {JSON: 'tss', DB_COL: 'tss', TYPE: INTEGER, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
                {JSON: 'rpe', DB_COL: 'rpe', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
                {JSON: 'hr', DB_COL: 'hr', TYPE: INTEGER, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: MEAN},
@@ -38,7 +41,10 @@ workout_map = [{JSON: 'km', DB_COL: 'km', TYPE: REAL, FACTOR: 1.0, DEFAULT: 0.0,
                {JSON: 'isRace', DB_COL: 'is_race', TYPE: BOOLEAN, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
                {JSON: 'brick', DB_COL: 'brick', TYPE: BOOLEAN, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
                {JSON: 'wattsEstimated', DB_COL: 'watts_estimated', TYPE: BOOLEAN, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: SUM},
-               {JSON: 'cadence', DB_COL: 'cadence', TYPE: INTEGER, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: MEAN}]
+               {JSON: 'cadence', DB_COL: 'cadence', TYPE: INTEGER, FACTOR: 1.0, DEFAULT: 0, AGGREGATION_METHOD: MEAN},
+               {JSON: 'rpe_tss', DB_COL: 'rpe_tss', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: SUM, MAPPER: 'rpe_tss_mapper'},
+               {JSON: 'mph', DB_COL: 'mph', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN, MAPPER: 'mph_mapper'},
+               {JSON: 'kph', DB_COL: 'kph', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN, MAPPER: 'kph_mapper'}]
 
 workout_col_names = ','.join([m[DB_COL] for m in workout_map])
 workout_zeroes = ','.join(['0' for _ in workout_map])
@@ -58,6 +64,13 @@ day_col_creation = ','.join(f"{m[DB_COL]} {m[TYPE]} DEFAULT {m[DEFAULT]}" for m 
 calculated_map = [{DB_COL: 'ctl', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
                   {DB_COL: 'atl', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
                   {DB_COL: 'tsb', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  {DB_COL: 'rpe_ctl', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  {DB_COL: 'rpe_atl', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  {DB_COL: 'rpe_tsb', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  {DB_COL: 'monotony', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  {DB_COL: 'strain', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  {DB_COL: 'rpe_monotony', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
+                  {DB_COL: 'rpe_strain', TYPE: REAL, DEFAULT: 0.0, AGGREGATION_METHOD: MEAN},
                   ]
 
 calculated_col_creation = ','.join(f"{m[DB_COL]} {m[TYPE]} DEFAULT {m[DEFAULT]}" for m in calculated_map)
@@ -91,6 +104,8 @@ DB_NAME = 'training_data_warehouse.sqlite3'
 
 def populate():
 
+    s = datetime.datetime.now()
+
     conn = sqlite3.connect(DB_NAME)
 
     f = open('TrainingDiary.json')
@@ -119,8 +134,15 @@ def populate():
             if not day_exists(d_date, t, conn):
                 execute_day_sql(conn, d_date, d['type'], day_col_names, d_values, table_name=t)
 
+    print(f'Days on in {datetime.datetime.now() - s}')
+    s = datetime.datetime.now()
+    print('starting kg and fat%')
     populate_kg_fat_percent(conn, data, min_date, max_date)
+    print(f'Done in {datetime.datetime.now() - s}')
+    s = datetime.datetime.now()
+    print('starting hr and HRV')
     populate_hr_sdnn_rmssd(conn, data, min_date, max_date)
+    print(f'Done in {datetime.datetime.now() - s}')
 
     conn.commit()
     conn.close()
@@ -231,17 +253,52 @@ def calculate_all_tsb():
 
 
 def calculate_tsb(conn, table_name):
-    sql_str = f'SELECT id, tss FROM {table_name} ORDER BY date'
-    atl = ctl = 0.0
+    sql_str = f'SELECT id, tss, rpe_tss FROM {table_name} ORDER BY date'
+    atl = ctl = rpe_atl = rpe_ctl = 0.0
 
     results = conn.cursor().execute(sql_str)
     for r in results:
         id = r[0]
         tss = r[1]
+        rpe_tss = r[2]
         ctl = tss * CTL_IMPACT + ctl * CTL_DECAY
         atl = tss * ATL_IMPACT + atl * ATL_DECAY
         tsb = ctl - atl
-        sql_str = f'UPDATE {table_name} SET ctl={ctl}, atl={atl}, tsb={tsb} WHERE id={id}'
+        rpe_ctl = rpe_tss * CTL_IMPACT + rpe_ctl * CTL_DECAY
+        rpe_atl = rpe_tss * ATL_IMPACT + rpe_atl * ATL_DECAY
+        rpe_tsb = rpe_ctl - rpe_atl
+        sql_str = f'''
+            UPDATE {table_name} SET 
+            ctl={ctl}, atl={atl}, tsb={tsb}, rpe_ctl={rpe_ctl}, rpe_atl={rpe_atl}, rpe_tsb={rpe_tsb} 
+            WHERE id={id}'''
+        conn.cursor().execute(sql_str)
+
+def calculate_all_strain():
+    conn = sqlite3.connect(DB_NAME)
+
+    for r in table_list(conn):
+        calculate_monotony_strain(conn, r)
+
+    conn.commit()
+
+
+def calculate_monotony_strain(conn, table_name):
+    df = pd.read_sql(f'SELECT id, date, tss, rpe_tss from {table_name} ORDER BY date', conn)
+    df['tss_stdev'] = df['tss'].rolling(7, min_periods=0).std().clip(lower=0.01)
+    df['rpe_tss_stdev'] = df['rpe_tss'].rolling(7, min_periods=0).std().clip(lower=0.01)
+    df['monotony'] = df['tss'].rolling(7, min_periods=1).mean() / df['tss_stdev']
+    df['strain'] = df['tss'].rolling(7, min_periods=1).sum() * df['monotony']
+    df['rpe_monotony'] = df['rpe_tss'].rolling(7, min_periods=1).mean() / df['rpe_tss_stdev']
+    df['rpe_strain'] = df['rpe_tss'].rolling(7, min_periods=1).sum() * df['rpe_monotony']
+    df.fillna(0, inplace=True)
+
+    for index, row in df.iterrows():
+        sql_str = f'''
+            UPDATE {table_name} SET
+            monotony={row['monotony']}, strain={row['strain']}, 
+            rpe_monotony={row['rpe_monotony']}, rpe_strain={row['rpe_strain']}
+            WHERE id={row['id']}
+        '''
         conn.cursor().execute(sql_str)
 
 
@@ -320,6 +377,7 @@ def save_workout(conn, d_date, d_type, d_values, workout, keys):
 
     col_names = f'{day_col_names}, {workout_col_names}'
     d_values = f'{d_values}, {w_values}'
+
     execute_day_sql(conn, d_date, d_type, col_names, d_values, activity=a, activity_type=at, equipment_name=e_name)
 
 
@@ -348,10 +406,14 @@ def aggregate_workouts(workouts, keys):
             for map in workout_map:
                 r = 0
                 for w in w_array:
-                    if map[AGGREGATION_METHOD] == SUM:
-                        r += w[map[JSON]]
+                    if MAPPER in map:
+                        value = eval(f'{map[MAPPER]}({w})')
                     else:
-                        r += w[map[JSON]] * w['seconds']
+                        value = w[map[JSON]]
+                    if map[AGGREGATION_METHOD] == SUM:
+                        r += value
+                    else:
+                        r += value * w['seconds']
                 d[map[JSON]] = r
             for map in workout_map:
                 if map[AGGREGATION_METHOD] == MEAN:
@@ -366,7 +428,10 @@ def aggregate_workouts(workouts, keys):
 def value_string_for_sql(dictionary, json_map):
     d_value_array = []
     for m in json_map:
-        if m[TYPE] == INTEGER:
+        if MAPPER in m:
+            value = eval(f'{m[MAPPER]}({dictionary})')
+            d_value_array.append(str(value))
+        elif m[TYPE] == INTEGER:
             d_value_array.append(str(int(round(float(dictionary[m[JSON]]) * m[FACTOR], 0))))
         elif m[TYPE] == REAL:
             d_value_array.append(str(round(float(dictionary[m[JSON]]) * m[FACTOR],2)))
@@ -484,6 +549,37 @@ def create_agg_and_insert_str_for_sql():
     return ','.join(aggregate_array), ','.join(insert_array)
 
 
+def mph_mapper(workout_dict):
+    result = 0.0
+    if 'km' in workout_dict and 'seconds' in workout_dict:
+        seconds = float(workout_dict['seconds'])
+        if seconds > 0:
+            result = round(float(workout_dict['km']) * MILES_PER_KM * 60 * 60 / float(workout_dict['seconds']), 1)
+
+    return result
+
+
+def kph_mapper(workout_dict):
+    result = 0.0
+    if 'km' in workout_dict and 'seconds' in workout_dict:
+        seconds = float(workout_dict['seconds'])
+        if seconds > 0:
+            result = round(float(workout_dict['km']) * 60 * 60 / float(workout_dict['seconds']), 1)
+
+    return result
+
+
+def rpe_tss_mapper(workout_dict):
+    result = 0.0
+    if 'rpe' in workout_dict and 'seconds' in workout_dict:
+        seconds = float(workout_dict['seconds'])
+        rpe = float(workout_dict['rpe'])
+        if seconds > 0:
+            #  factor is (100/49)/3600 -  to make rep 7 for an hour 100 TSS.
+            #  This is 1 / (49 * 36)
+            result = round(rpe * rpe * seconds / (49 * 36), 1)
+
+    return result
 
 if __name__ == '__main__':
     start = datetime.datetime.now()
@@ -494,6 +590,11 @@ if __name__ == '__main__':
     start = datetime.datetime.now()
     print('Calculating TSB ...')
     calculate_all_tsb()
+    print(f'DONE in {datetime.datetime.now() - start}')
+
+    start = datetime.datetime.now()
+    print('Calculating Strain ...')
+    calculate_all_strain()
     print(f'DONE in {datetime.datetime.now() - start}')
 
     # start = datetime.datetime.now()
